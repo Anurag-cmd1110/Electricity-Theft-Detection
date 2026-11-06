@@ -1,0 +1,29 @@
+{
+    "project": "GridGuard",
+    "model": "RandomForestClassifier",
+    "selected_class_weight": "balanced",
+    "dataset_type": "synthetic_demonstration",
+    "total_samples": 2000,
+    "training_samples": 1200,
+    "validation_samples": 400,
+    "test_samples": 400,
+    "decision_threshold": 0.7915367251419186,
+    "validation_average_precision": 0.20393940726856072,
+    "test_metrics": {
+        "accuracy": 0.9725,
+        "precision": 1.0,
+        "recall": 0.3125,
+        "f1_score": 0.47619047619047616,
+        "average_precision": 0.35796879317131736,
+        "roc_auc": 0.6446940104166666,
+        "false_positive_rate": 0.0,
+        "false_negative_rate": 0.6875
+    },
+    "confusion_matrix": {
+        "true_normal_predicted_normal": 384,
+        "true_normal_predicted_suspicious": 0,
+        "true_suspicious_predicted_normal": 11,
+        "true_suspicious_predicted_suspicious": 5
+    },
+    "important_note": "Results use synthetic demonstration data and do not establish real-world electricity theft detection accuracy."
+}

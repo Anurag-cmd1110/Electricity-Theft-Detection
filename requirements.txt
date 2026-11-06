@@ -1,0 +1,8 @@
+Library	Purpose
+FastAPI	Backend API
+Uvicorn	Runs the API server
+Pandas, NumPy	Data processing
+Scikit-learn	Machine learning
+Joblib	Save and load trained models
+PyMongo	Connect to MongoDB
+python-dotenv	Manage configuration variables

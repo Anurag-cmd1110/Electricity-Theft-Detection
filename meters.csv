@@ -1,0 +1,9 @@
+meter_id,previous_month_kwh,current_month_kwh,avg_daily_kwh,usage_change_pct,night_usage_ratio,weekend_usage_ratio,zero_reading_days
+MTR-TEST-101,320,80,2.67,-75.0,0.06,0.35,6
+MTR-TEST-102,240,255,8.5,6.25,0.31,1.02,0
+MTR-TEST-103,410,95,3.17,-76.83,0.08,0.40,8
+MTR-TEST-104,180,185,6.17,2.78,0.29,0.98,0
+MTR-TEST-105,500,120,4.0,-76.0,0.05,0.30,7
+MTR-TEST-106,210,205,6.83,-2.38,0.30,0.95,0
+MTR-TEST-107,350,340,11.33,-2.86,0.33,1.05,1
+MTR-TEST-108,290,75,2.5,-74.14,0.07,0.42,5

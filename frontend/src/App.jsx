@@ -226,6 +226,10 @@ function App() {
   const [batchLoading, setBatchLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
 
+  // Staged selection for investigation status before clicking submit
+  const [pendingStatuses, setPendingStatuses] = useState({});
+  const [savingStatusId, setSavingStatusId] = useState(null);
+
   const fileInputRef = useRef(null);
   const pdfInputRef = useRef(null);
 
@@ -296,20 +300,23 @@ function App() {
     });
   }, [history, selectedMeter, selectedPeriod]);
 
+  // Unified single source of truth: ensures top cards match substation table counts
   const summary = useMemo(() => {
-    const normalCount = filteredHistory.filter((r) => getPrediction(r) === "Normal").length;
-    const suspiciousCount = filteredHistory.filter((r) => getPrediction(r) === "Suspicious").length;
+    const totalConnectedMeters = feederBalance.reduce((acc, f) => acc + (f.meters || 0), 0);
+    const totalSuspiciousMeters = feederBalance.reduce((acc, f) => acc + (f.suspicious_meters || 0), 0);
+    const totalNormalMeters = Math.max(0, totalConnectedMeters - totalSuspiciousMeters);
+
     const avgRisk = filteredHistory.length
       ? filteredHistory.reduce((acc, r) => acc + getRiskScore(r), 0) / filteredHistory.length
       : 0;
 
     return {
-      total: filteredHistory.length,
-      normal: normalCount,
-      suspicious: suspiciousCount,
+      total: totalConnectedMeters > 0 ? totalConnectedMeters : filteredHistory.length,
+      normal: totalNormalMeters,
+      suspicious: totalSuspiciousMeters,
       averageRisk: avgRisk,
     };
-  }, [filteredHistory]);
+  }, [filteredHistory, feederBalance]);
 
   const riskDistribution = useMemo(() => {
     return [
@@ -349,17 +356,46 @@ function App() {
     });
   }, [filteredHistory]);
 
-  const handleStatusChange = async (meterId, newStatus) => {
+  const handleSelectStatus = (meterId, newStatus) => {
+    setPendingStatuses((prev) => ({ ...prev, [meterId]: newStatus }));
+  };
+
+  const handleSubmitInvestigation = async (meterId, currentStatus) => {
+    const statusToSave = pendingStatuses[meterId] || currentStatus || "pending";
+    setSavingStatusId(meterId);
     try {
-      await updateInvestigationStatus(meterId, newStatus);
-      setInvestigations((prev) =>
-        prev.map((inv) => (inv.meter_id === meterId ? { ...inv, status: newStatus } : inv))
-      );
+      await updateInvestigationStatus(meterId, statusToSave);
+
+      // If resolved, remove it from Open Investigations. If under investigation, keep it.
+      setInvestigations((prev) => {
+        if (statusToSave === "resolved_theft" || statusToSave === "false_positive") {
+          return prev.filter((inv) => inv.meter_id !== meterId);
+        }
+        return prev.map((inv) =>
+          inv.meter_id === meterId ? { ...inv, status: statusToSave, updated_at: new Date().toISOString() } : inv
+        );
+      });
+
+      // Update audit status in telemetry logs
       setHistory((prev) =>
-        prev.map((r) => (getMeterId(r) === meterId ? { ...r, audit_status: newStatus } : r))
+        prev.map((r) => (getMeterId(r) === meterId ? { ...r, audit_status: statusToSave } : r))
       );
+
+      setPendingStatuses((prev) => {
+        const copy = { ...prev };
+        delete copy[meterId];
+        return copy;
+      });
+
+      const msg =
+        statusToSave === "resolved_theft" || statusToSave === "false_positive"
+          ? `Investigation for ${meterId} marked as "${statusToSave}" and removed from open queue.`
+          : `Investigation for ${meterId} marked as "${statusToSave}" (active).`;
+      setSuccessMessage(msg);
     } catch (err) {
       alert("Failed to update status: " + err.message);
+    } finally {
+      setSavingStatusId(null);
     }
   };
 
@@ -399,12 +435,7 @@ function App() {
       });
       setSuccessMessage(`Meter ${meterForm.meter_id} registered successfully.`);
       setMeterForm(INITIAL_METER_FORM);
-      const [reg, fData] = await Promise.all([
-        fetchMeterRegistry(),
-        fetchFeederBalance().catch(() => ({ feeders: [] })),
-      ]);
-      setMetersList(reg.meters || []);
-      setFeederBalance(fData.feeders || []);
+      await loadAllData();
     } catch (err) {
       setFormError(err.message || "Registration failed.");
     }
@@ -650,7 +681,6 @@ function App() {
 
   return (
     <div className="app-shell">
-      {/* Mobile Backdrop */}
       {mobileMenuOpen && (
         <div
           className="modal-backdrop"
@@ -659,7 +689,6 @@ function App() {
         />
       )}
 
-      {/* Sidebar with Drawer Toggle */}
       <aside className={`sidebar ${mobileMenuOpen ? "mobile-open" : ""}`}>
         <div className="brand">
           <div className="brand-mark">G</div>
@@ -684,8 +713,8 @@ function App() {
             >
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
-              {item.id === "anomalies" && summary.suspicious > 0 && (
-                <span className="nav-count">{summary.suspicious}</span>
+              {item.id === "anomalies" && investigations.length > 0 && (
+                <span className="nav-count">{investigations.length}</span>
               )}
             </button>
           ))}
@@ -764,7 +793,7 @@ function App() {
               </div>
 
               <div className="stats-grid">
-                <StatCard title="Total analyses" value={summary.total} description="Audit entries" icon="▤" />
+                <StatCard title="Total Connected Meters" value={summary.total} description="Across distribution substations" icon="▤" />
                 <StatCard title="Normal meters" value={summary.normal} description="Healthy patterns" icon="✓" tone="success" />
                 <StatCard title="Suspicious meters" value={summary.suspicious} description="Flagged for review" icon="⚠" tone="danger" />
                 <StatCard title="Average risk" value={`${formatNumber(summary.averageRisk)}%`} description="System aggregate" icon="◉" tone="warning" />
@@ -1591,6 +1620,7 @@ function App() {
                           <th>Triggers & Root Causes</th>
                           <th>Audit Status</th>
                           <th>Last Modified</th>
+                          <th style={{ textAlign: "center" }}>Action</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1599,6 +1629,11 @@ function App() {
                             inv.reasons && inv.reasons.length > 0
                               ? inv.reasons
                               : ["Significant drop in consumption detected", "Suppressed baseline usage"];
+
+                          const selectedVal = pendingStatuses[inv.meter_id] ?? inv.status ?? "pending";
+                          const hasUnsavedChange =
+                            pendingStatuses[inv.meter_id] !== undefined &&
+                            pendingStatuses[inv.meter_id] !== inv.status;
 
                           return (
                             <tr key={inv.id}>
@@ -1625,8 +1660,8 @@ function App() {
                               <td>
                                 <select
                                   className="status-selector"
-                                  value={inv.status || "pending"}
-                                  onChange={(e) => handleStatusChange(inv.meter_id, e.target.value)}
+                                  value={selectedVal}
+                                  onChange={(e) => handleSelectStatus(inv.meter_id, e.target.value)}
                                 >
                                   <option value="pending">⏳ Pending Review</option>
                                   <option value="under_investigation">🔍 Under Investigation</option>
@@ -1635,6 +1670,23 @@ function App() {
                                 </select>
                               </td>
                               <td>{formatDate(inv.updated_at)}</td>
+                              <td style={{ textAlign: "center" }}>
+                                <button
+                                  type="button"
+                                  className="primary-button"
+                                  style={{
+                                    padding: "5px 12px",
+                                    fontSize: "11.5px",
+                                    background: hasUnsavedChange ? "#6366f1" : "rgba(99, 102, 241, 0.2)",
+                                    border: hasUnsavedChange ? "1px solid #818cf8" : "1px solid rgba(99, 102, 241, 0.4)",
+                                    cursor: savingStatusId === inv.meter_id ? "wait" : "pointer",
+                                  }}
+                                  disabled={savingStatusId === inv.meter_id}
+                                  onClick={() => handleSubmitInvestigation(inv.meter_id, inv.status)}
+                                >
+                                  {savingStatusId === inv.meter_id ? "Saving…" : hasUnsavedChange ? "Submit *" : "Submit"}
+                                </button>
+                              </td>
                             </tr>
                           );
                         })}

@@ -24,11 +24,11 @@ from ml.predict import predict_meter
 router = APIRouter(prefix="/meters", tags=["Meters"])
 
 DEFAULT_FEEDER_ZONES = [
-    "Sector 4 Feeder (Substation A)",
-    "Morabadi Feeder (Substation B)",
-    "Kanke Road Feeder (Substation C)",
-    "Harmu Feeder (Substation D)",
-    "Doranda Substation Feeder",
+    "North Feeder (Substation D)",
+    "South Feeder (Substation B)",
+    "Industrial Road Feeder (Substation C)",
+    "Central Substation Feeder",
+    "East Feeder (Substation A)",
 ]
 
 
@@ -40,7 +40,7 @@ class RegisterMeterRequest(BaseModel):
     meter_id: str = Field(min_length=1, max_length=100)
     consumer_name: str = Field(min_length=1, max_length=150)
     sanctioned_load_kw: float = Field(gt=0)
-    meter_type: str = Field(default="Single Phase")
+    meter_type: str = Field(default="Three Phase Smart")
     area_zone: str = Field(default="", max_length=100)
 
 
@@ -116,15 +116,12 @@ def update_consumer_name(meter_id: str, body: UpdateConsumerNameRequest):
 
 @router.post("/registry/sync-from-history")
 def sync_meters_from_history():
-    """Populate and redistribute all meters found in reading history across multiple feeders."""
-    unique_meter_ids = meter_readings.distinct("meter_id")
+    """Ensure all meters in history are represented in the registry."""
+    unique_meter_ids = [m for m in meter_readings.distinct("meter_id") if m and m != "Unknown"]
     synced_count = 0
     now = datetime.now(timezone.utc)
 
     for idx, mid in enumerate(unique_meter_ids):
-        if not mid or mid == "Unknown":
-            continue
-
         assigned_zone = DEFAULT_FEEDER_ZONES[idx % len(DEFAULT_FEEDER_ZONES)]
         existing = meters_collection.find_one({"meter_id": mid})
 
@@ -139,11 +136,7 @@ def sync_meters_from_history():
                 "created_at": now,
             })
             synced_count += 1
-        elif (
-            not existing.get("area_zone")
-            or existing.get("area_zone") == "General Feeder"
-            or existing.get("area_zone") == "General Substation"
-        ):
+        elif not existing.get("area_zone") or existing.get("area_zone") not in DEFAULT_FEEDER_ZONES:
             meters_collection.update_one(
                 {"meter_id": mid},
                 {"$set": {"area_zone": assigned_zone, "updated_at": now}}
@@ -178,6 +171,27 @@ def register_meter(meter_data: RegisterMeterRequest):
 
     try:
         saved = meters_collection.insert_one(doc)
+
+        # Baseline reading ensures registry and telemetry stay synchronized
+        init_kwh = round(float(meter_data.sanctioned_load_kw) * 35.0, 1)
+        meter_readings.insert_one({
+            "meter_id": meter_id,
+            "previous_month_kwh": init_kwh,
+            "current_month_kwh": init_kwh,
+            "avg_daily_kwh": round(init_kwh / 30.0, 2),
+            "usage_change_pct": 0.0,
+            "night_usage_ratio": 0.30,
+            "weekend_usage_ratio": 0.95,
+            "zero_reading_days": 0,
+            "risk_score": 10.0,
+            "threshold": 0.5,
+            "severity": "Low",
+            "prediction": "normal_pattern",
+            "reasons": ["Normal baseline profile"],
+            "warning": None,
+            "audit_status": "normal",
+            "created_at": now,
+        })
     except Exception as error:
         raise HTTPException(status_code=503, detail="Could not register meter in MongoDB.") from error
 
@@ -210,9 +224,9 @@ def get_meter_profile(meter_id: str):
     return {
         "profile": {
             "meter_id": meter_id,
-            "consumer_name": profile.get("consumer_name", "Unassigned") if profile else "Unassigned",
-            "sanctioned_load_kw": profile.get("sanctioned_load_kw", "—") if profile else "—",
-            "area_zone": profile.get("area_zone", "General Substation") if profile else "General Substation",
+            "consumer_name": profile.get("consumer_name", f"Consumer ({meter_id})") if profile else f"Consumer ({meter_id})",
+            "sanctioned_load_kw": profile.get("sanctioned_load_kw", "5.0") if profile else "5.0",
+            "area_zone": profile.get("area_zone", random.choice(DEFAULT_FEEDER_ZONES)) if profile else random.choice(DEFAULT_FEEDER_ZONES),
             "status": profile.get("status", "Active") if profile else "Active",
             "current_audit_status": current_status,
         },
@@ -264,10 +278,9 @@ def process_single_prediction(reading: MLPredictionRequest):
     existing_inv = investigations.find_one({"meter_id": meter_id})
     is_suspicious_flag = bool(result.get("is_suspicious")) or (float(result.get("risk_score", 0.0)) >= 50.0)
 
-    if existing_inv is not None:
-        initial_audit_status = existing_inv.get("status", "pending")
-    else:
-        initial_audit_status = "pending" if is_suspicious_flag else "none"
+    initial_audit_status = (
+        existing_inv.get("status", "pending") if existing_inv is not None else ("pending" if is_suspicious_flag else "none")
+    )
 
     risk_score = float(result.get("risk_score", 0.0))
     threshold = float(result.get("threshold", 0.5))
@@ -350,7 +363,6 @@ def predict_meter_reading(reading: MLPredictionRequest):
 
 @router.post("/predict/batch")
 async def batch_predict_csv(file: UploadFile = File(...)):
-    """Upload a CSV file containing telemetry batches to run bulk inference."""
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
@@ -399,7 +411,6 @@ async def batch_predict_csv(file: UploadFile = File(...)):
 
 @router.post("/predict/pdf")
 async def predict_from_bill_pdf(file: UploadFile = File(...)):
-    """Extract billing telemetry from an electricity bill PDF and run ML anomaly analysis."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF invoice files are accepted.")
 
@@ -413,9 +424,8 @@ async def predict_from_bill_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=f"Failed to read PDF file: {str(e)}")
 
     if not extracted_text.strip():
-        raise HTTPException(status_code=422, detail="No readable text found in PDF. Ensure it is a text-based digital bill.")
+        raise HTTPException(status_code=422, detail="No readable text found in PDF.")
 
-    # 1. Extract Meter ID
     meter_id_match = re.search(
         r"(?:Meter\s*(?:No|ID|#)|CA\s*No|Consumer\s*No)[\s:\n|]*([A-Za-z0-9\-]+)",
         extracted_text,
@@ -423,7 +433,6 @@ async def predict_from_bill_pdf(file: UploadFile = File(...)):
     )
     meter_id = meter_id_match.group(1).strip() if meter_id_match else f"BILL-{datetime.now(timezone.utc).strftime('%H%M%S')}"
 
-    # 2. Extract Units Consumed (Current Month kWh)
     units_match = re.search(
         r"(?:Units\s*Consumed\s*\(kWh\)|Billed\s*Units)[\s:\n|]*([0-9,]+(?:\.[0-9]+)?)",
         extracted_text,
@@ -439,12 +448,8 @@ async def predict_from_bill_pdf(file: UploadFile = File(...)):
         )
         curr_kwh = float(curr_kwh_match.group(1).replace(",", "")) if curr_kwh_match else 237.0
 
-    # 3. Extract Previous Month Units (from 6-Month history or baseline difference)
     history_match = re.findall(r"\b([0-9]{2,4})\b", extracted_text)
-    if history_match and len(history_match) >= 2:
-        prev_kwh = float(history_match[-2])
-    else:
-        prev_kwh = round(curr_kwh * 1.10, 1)
+    prev_kwh = float(history_match[-2]) if history_match and len(history_match) >= 2 else round(curr_kwh * 1.10, 1)
 
     daily_kwh = round(curr_kwh / 30.0, 2)
     usage_change = round(((curr_kwh - prev_kwh) / prev_kwh) * 100, 2) if prev_kwh > 0 else 0.0
@@ -499,16 +504,29 @@ def get_meter_history(limit: int = 50):
 
 
 # --------------------------------------------------
-# History Deletion Endpoints
+# Synchronized Deletions
 # --------------------------------------------------
 
 @router.delete("/history/record/{reading_id}")
 def delete_single_reading(reading_id: str):
     try:
-        res = meter_readings.delete_one({"_id": ObjectId(reading_id)})
-        if res.deleted_count == 0:
+        reading = meter_readings.find_one({"_id": ObjectId(reading_id)})
+        if not reading:
             raise HTTPException(status_code=404, detail="Reading record not found.")
+
+        mid = reading.get("meter_id")
+        res = meter_readings.delete_one({"_id": ObjectId(reading_id)})
+
+        # Remove orphaned meter from registry and investigations if no other readings remain
+        if mid:
+            remaining = meter_readings.count_documents({"meter_id": mid})
+            if remaining == 0:
+                meters_collection.delete_one({"meter_id": mid})
+                investigations.delete_one({"meter_id": mid})
+
         return {"message": "Reading removed successfully.", "deleted_count": res.deleted_count}
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Failed to delete reading: {str(error)}") from error
 
@@ -518,10 +536,12 @@ def delete_meter_history(meter_id: str):
     try:
         res_readings = meter_readings.delete_many({"meter_id": meter_id})
         res_inv = investigations.delete_many({"meter_id": meter_id})
+        res_meters = meters_collection.delete_many({"meter_id": meter_id})
         return {
-            "message": f"Cleared history for {meter_id}.",
+            "message": f"Cleared history and removed meter {meter_id}.",
             "deleted_readings": res_readings.deleted_count,
             "deleted_investigations": res_inv.deleted_count,
+            "deleted_meters": res_meters.deleted_count,
         }
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Failed to delete meter history: {str(error)}") from error
@@ -532,10 +552,12 @@ def clear_all_history():
     try:
         res_readings = meter_readings.delete_many({})
         res_inv = investigations.delete_many({})
+        res_meters = meters_collection.delete_many({})
         return {
-            "message": "All meter history and investigations purged successfully.",
+            "message": "All meter history, investigations, and registry purged.",
             "deleted_readings": res_readings.deleted_count,
             "deleted_investigations": res_inv.deleted_count,
+            "deleted_meters": res_meters.deleted_count,
         }
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Failed to clear history: {str(error)}") from error
@@ -543,48 +565,15 @@ def clear_all_history():
 
 @router.get("/investigations")
 def get_investigations():
+    """Returns only OPEN investigations (pending review or under active investigation)."""
     try:
-        count = investigations.count_documents({})
-        if count == 0:
-            suspicious_readings = list(
-                meter_readings.find({
-                    "$or": [
-                        {"prediction": "suspicious_pattern"},
-                        {"prediction": "Suspicious"},
-                        {"risk_score": {"$gte": 50}}
-                    ]
-                }).sort("created_at", -1)
-            )
-            for r in suspicious_readings:
-                mid = r.get("meter_id", "Unknown")
-                score = r.get("risk_score", 0)
-                sev = "High" if score >= 70 else "Medium"
-                investigations.update_one(
-                    {"meter_id": mid},
-                    {
-                        "$set": {
-                            "meter_id": mid,
-                            "latest_reading_id": str(r["_id"]),
-                            "risk_score": score,
-                            "severity": r.get("severity", sev),
-                            "reasons": r.get("reasons", ["Significant drop in consumption detected"]),
-                            "status": "pending",
-                            "updated_at": r.get("created_at", datetime.now(timezone.utc)),
-                        },
-                        "$setOnInsert": {
-                            "created_at": r.get("created_at", datetime.now(timezone.utc)),
-                            "notes": "",
-                        },
-                    },
-                    upsert=True,
-                )
-
-        items = list(investigations.find().sort("updated_at", -1))
+        items = list(
+            investigations.find(
+                {"status": {"$in": ["pending", "under_investigation"]}}
+            ).sort("updated_at", -1)
+        )
     except Exception as error:
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to retrieve investigations from MongoDB.",
-        ) from error
+        raise HTTPException(status_code=503, detail="Unable to retrieve investigations.") from error
 
     for item in items:
         item["id"] = str(item.pop("_id"))
@@ -620,50 +609,74 @@ def update_investigation_status(meter_id: str, body: UpdateInvestigationStatusRe
 
 
 # --------------------------------------------------
-# Feeder Energy Balance & Connected Meters Analytics
+# Feeder Energy Balance (Strict Unique Meter Count)
 # --------------------------------------------------
 
 @router.get("/analytics/feeder-balance")
 def get_feeder_balance(tariff_per_kwh: float = 6.50):
     try:
-        meters = list(meters_collection.find())
         readings = list(meter_readings.find().sort("created_at", -1))
 
-        meters_dict = {m.get("meter_id"): m for m in meters}
-
+        # Distinct latest reading per unique meter ID
         latest_readings = {}
         for r in readings:
             mid = r.get("meter_id")
             if mid and mid not in latest_readings:
                 latest_readings[mid] = r
 
-        all_meter_ids = list(set(list(meters_dict.keys()) + list(latest_readings.keys())))
+        active_meter_ids = set(latest_readings.keys())
 
-        feeder_groups = {}
-        for idx, mid in enumerate(all_meter_ids):
+        # Clean orphaned entries from registry
+        meters_collection.delete_many({"meter_id": {"$nin": list(active_meter_ids)}})
+        investigations.delete_many({"meter_id": {"$nin": list(active_meter_ids)}})
+
+        meters = list(meters_collection.find())
+        meters_dict = {m.get("meter_id"): m for m in meters}
+
+        now = datetime.now(timezone.utc)
+        for idx, mid in enumerate(active_meter_ids):
+            if mid not in meters_dict:
+                assigned_zone = DEFAULT_FEEDER_ZONES[idx % len(DEFAULT_FEEDER_ZONES)]
+                new_doc = {
+                    "meter_id": mid,
+                    "consumer_name": f"Consumer ({mid})",
+                    "sanctioned_load_kw": 5.0,
+                    "meter_type": "Three Phase Smart",
+                    "area_zone": assigned_zone,
+                    "status": "Active",
+                    "created_at": now,
+                }
+                meters_collection.insert_one(new_doc)
+                meters_dict[mid] = new_doc
+
+        feeder_groups = {
+            zone: {
+                "zone": zone,
+                "meter_count": 0,
+                "connected_meters": [],
+                "billed_consumption_kwh": 0.0,
+                "suspicious_meters": 0,
+                "estimated_stolen_kwh": 0.0,
+            }
+            for zone in DEFAULT_FEEDER_ZONES
+        }
+
+        for mid in sorted(active_meter_ids):
             m_profile = meters_dict.get(mid, {})
             reading = latest_readings.get(mid, {})
 
             zone = m_profile.get("area_zone")
-            if not zone or zone in ["General Feeder", "General Substation"]:
-                zone = DEFAULT_FEEDER_ZONES[idx % len(DEFAULT_FEEDER_ZONES)]
+            if not zone or zone not in feeder_groups:
+                zone = DEFAULT_FEEDER_ZONES[abs(hash(mid)) % len(DEFAULT_FEEDER_ZONES)]
+                meters_collection.update_one({"meter_id": mid}, {"$set": {"area_zone": zone}})
 
             consumer_name = m_profile.get("consumer_name", f"Consumer ({mid})")
             curr_kwh = float(reading.get("current_month_kwh", 0))
             is_theft = (
                 reading.get("prediction") in ["suspicious_pattern", "Suspicious"]
                 or float(reading.get("risk_score", 0)) >= 50
+                or reading.get("is_suspicious") is True
             )
-
-            if zone not in feeder_groups:
-                feeder_groups[zone] = {
-                    "zone": zone,
-                    "meter_count": 0,
-                    "connected_meters": [],
-                    "billed_consumption_kwh": 0.0,
-                    "suspicious_meters": 0,
-                    "estimated_stolen_kwh": 0.0,
-                }
 
             feeder_groups[zone]["meter_count"] += 1
             feeder_groups[zone]["connected_meters"].append({
@@ -681,7 +694,8 @@ def get_feeder_balance(tariff_per_kwh: float = 6.50):
                 feeder_groups[zone]["estimated_stolen_kwh"] += diff
 
         summary = []
-        for zone, data in feeder_groups.items():
+        for zone in DEFAULT_FEEDER_ZONES:
+            data = feeder_groups[zone]
             billed = data["billed_consumption_kwh"]
             stolen = data["estimated_stolen_kwh"]
             tech_loss = billed * 0.08
